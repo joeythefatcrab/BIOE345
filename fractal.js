@@ -1,218 +1,420 @@
-// Fractal Explorer — Mandelbrot & Julia set renderer
-// All math runs on the client; canvas pixels are colored per-point
-// by how many iterations it took to "escape".
+// Fractal Explorer — GPU (WebGL) Edition
+// All fractal math runs per-pixel on the GPU via a fragment shader,
+// which is what makes real-time smooth zoom/pan possible.
 
-const canvas = document.getElementById("fractalCanvas");
-const ctx = canvas.getContext("2d");
-const coordsEl = document.getElementById("coords");
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl", { preserveDrawingBuffer: true }) ||
+           canvas.getContext("experimental-webgl", { preserveDrawingBuffer: true });
 
-const state = {
-  type: "mandelbrot",
-  maxIter: 200,
-  centerRe: -0.5,
-  centerIm: 0,
-  scale: 2.5, // width of view in the complex plane
-  juliaRe: -0.7,
-  juliaIm: 0.27,
-  palette: "twilight",
-};
-
-// ---- Color palettes ----
-// Each takes a normalized value t in [0,1] and returns [r,g,b]
-const palettes = {
-  twilight(t) {
-    const r = 40 + 180 * Math.sin(Math.PI * t + 0.5);
-    const g = 20 + 60 * t;
-    const b = 90 + 140 * Math.cos(Math.PI * t * 0.7);
-    return [clamp(r), clamp(g + 90 * t), clamp(b)];
-  },
-  fire(t) {
-    return [clamp(255 * Math.min(1, t * 2)), clamp(255 * Math.max(0, t * 2 - 0.5) * 1.6), clamp(60 * t)];
-  },
-  ocean(t) {
-    return [clamp(20 * t), clamp(120 * t + 40), clamp(180 * t + 70)];
-  },
-  rainbow(t) {
-    const hue = t * 360;
-    return hsvToRgb(hue, 0.8, 1);
-  },
-  mono(t) {
-    const v = clamp(255 * t);
-    return [v, v, v];
-  },
-};
-
-function clamp(v) {
-  return Math.max(0, Math.min(255, v));
+if (!gl) {
+  document.body.innerHTML = "<p style='color:#fff;padding:40px;font-family:sans-serif'>" +
+    "Your browser doesn't support WebGL, which this fractal renderer needs. " +
+    "Try a recent Chrome, Firefox, or Edge.</p>";
+  throw new Error("WebGL not supported");
 }
 
-function hsvToRgb(h, s, v) {
-  const c = v * s;
-  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-  const m = v - c;
-  let r = 0, g = 0, b = 0;
-  if (h < 60) [r, g, b] = [c, x, 0];
-  else if (h < 120) [r, g, b] = [x, c, 0];
-  else if (h < 180) [r, g, b] = [0, c, x];
-  else if (h < 240) [r, g, b] = [0, x, c];
-  else if (h < 300) [r, g, b] = [x, 0, c];
-  else [r, g, b] = [c, 0, x];
-  return [clamp((r + m) * 255), clamp((g + m) * 255), clamp((b + m) * 255)];
-}
-
-// ---- Core escape-time calculation ----
-function escapeIterations(cRe, cIm, maxIter, type, juliaRe, juliaIm) {
-  let zRe, zIm, addRe, addIm;
-  if (type === "mandelbrot") {
-    zRe = 0; zIm = 0;
-    addRe = cRe; addIm = cIm;
-  } else {
-    // Julia set: z starts at the pixel's own coordinate,
-    // and the added constant is fixed for the whole image.
-    zRe = cRe; zIm = cIm;
-    addRe = juliaRe; addIm = juliaIm;
+const VERTEX_SRC = `
+  attribute vec2 a_pos;
+  void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
   }
-  for (let i = 0; i < maxIter; i++) {
-    const zRe2 = zRe * zRe - zIm * zIm + addRe;
-    const zIm2 = 2 * zRe * zIm + addIm;
-    zRe = zRe2; zIm = zIm2;
-    if (zRe * zRe + zIm * zIm > 4) {
-      // smooth coloring: fractional escape count reduces banding
-      const log_zn = Math.log(zRe * zRe + zIm * zIm) / 2;
-      const nu = Math.log(log_zn / Math.log(2)) / Math.log(2);
-      return i + 1 - nu;
+`;
+
+const FRAGMENT_SRC = `
+  precision highp float;
+
+  uniform vec2 u_resolution;
+  uniform vec2 u_center;
+  uniform float u_scale;
+  uniform int u_maxIter;
+  uniform int u_type;       // 0 mandelbrot, 1 julia, 2 burning ship, 3 tricorn
+  uniform vec2 u_juliaC;
+  uniform int u_palette;
+  uniform float u_time;     // for color cycling
+
+  vec3 palette(float t, int p) {
+    t = clamp(t, 0.0, 1.0);
+    if (p == 0) {
+      // Twilight
+      float r = 0.16 + 0.7 * sin(3.14159 * t + 0.5);
+      float g = 0.08 + 0.6 * t;
+      float b = 0.35 + 0.55 * cos(3.14159 * t * 0.7);
+      return clamp(vec3(r, g, b), 0.0, 1.0);
+    } else if (p == 1) {
+      // Fire
+      return clamp(vec3(min(1.0, t * 2.0), max(0.0, t * 2.0 - 0.5) * 1.6, 0.25 * t), 0.0, 1.0);
+    } else if (p == 2) {
+      // Ocean
+      return clamp(vec3(0.08 * t, 0.47 * t + 0.15, 0.7 * t + 0.27), 0.0, 1.0);
+    } else if (p == 3) {
+      // Rainbow (HSV)
+      float h = t * 6.0;
+      float c = 1.0;
+      float x = 1.0 - abs(mod(h, 2.0) - 1.0);
+      vec3 col;
+      if (h < 1.0) col = vec3(c, x, 0.0);
+      else if (h < 2.0) col = vec3(x, c, 0.0);
+      else if (h < 3.0) col = vec3(0.0, c, x);
+      else if (h < 4.0) col = vec3(0.0, x, c);
+      else if (h < 5.0) col = vec3(x, 0.0, c);
+      else col = vec3(c, 0.0, x);
+      return col;
+    } else if (p == 4) {
+      // Neon (magenta/cyan glow)
+      float r = 0.5 + 0.5 * sin(6.2832 * t + 0.0);
+      float g = 0.5 + 0.5 * sin(6.2832 * t + 2.1);
+      float b = 0.5 + 0.5 * sin(6.2832 * t + 4.2);
+      return vec3(r, g, b);
+    } else {
+      // Monochrome
+      return vec3(t);
     }
   }
-  return maxIter; // never escaped -> inside the set
-}
 
-function render() {
-  const w = canvas.width, h = canvas.height;
-  const imgData = ctx.createImageData(w, h);
-  const data = imgData.data;
+  void main() {
+    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    vec2 c0 = u_center + uv * u_scale;
 
-  const { maxIter, centerRe, centerIm, scale, type, juliaRe, juliaIm, palette } = state;
-  const paletteFn = palettes[palette] || palettes.twilight;
-  const aspect = h / w;
-  const halfW = scale / 2;
-  const halfH = scale * aspect / 2;
+    vec2 z;
+    vec2 c;
+    if (u_type == 1) {
+      // Julia: z starts at the pixel, c is fixed
+      z = c0;
+      c = u_juliaC;
+    } else {
+      z = vec2(0.0);
+      c = c0;
+    }
 
-  for (let py = 0; py < h; py++) {
-    const imag = centerIm + (py / h - 0.5) * 2 * halfH;
-    for (let px = 0; px < w; px++) {
-      const real = centerRe + (px / w - 0.5) * 2 * halfW;
-      const iter = escapeIterations(real, imag, maxIter, type, juliaRe, juliaIm);
-      const idx = (py * w + px) * 4;
-
-      if (iter >= maxIter) {
-        data[idx] = 5; data[idx + 1] = 5; data[idx + 2] = 10; data[idx + 3] = 255;
+    float iter = 0.0;
+    const int MAX_STEPS = 1500;
+    bool escaped = false;
+    for (int i = 0; i < MAX_STEPS; i++) {
+      if (i >= u_maxIter) break;
+      vec2 zAbs = z;
+      if (u_type == 2) {
+        // Burning Ship uses abs(x), abs(y) before squaring
+        zAbs = abs(z);
+      }
+      float x2 = zAbs.x * zAbs.x - zAbs.y * zAbs.y;
+      float y2;
+      if (u_type == 3) {
+        // Tricorn: conjugate iteration z -> conj(z)^2 + c
+        y2 = -2.0 * zAbs.x * zAbs.y;
       } else {
-        const t = iter / maxIter;
-        const [r, g, b] = paletteFn(t);
-        data[idx] = r; data[idx + 1] = g; data[idx + 2] = b; data[idx + 3] = 255;
+        y2 = 2.0 * zAbs.x * zAbs.y;
+      }
+      z = vec2(x2, y2) + c;
+
+      float mag2 = dot(z, z);
+      if (mag2 > 4.0) {
+        // smooth iteration count
+        float logZn = log(mag2) * 0.5;
+        float nu = log(logZn / log(2.0)) / log(2.0);
+        iter = float(i) + 1.0 - nu;
+        escaped = true;
+        break;
       }
     }
+
+    if (!escaped) {
+      gl_FragColor = vec4(0.01, 0.01, 0.03, 1.0);
+      return;
+    }
+
+    float t = iter / float(u_maxIter);
+    t = fract(t * 2.4 + u_time);
+    vec3 col = palette(t, u_palette);
+    gl_FragColor = vec4(col, 1.0);
   }
-  ctx.putImageData(imgData, 0, 0);
+`;
+
+function compileShader(src, type) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, src);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(shader));
+    throw new Error("Shader compile failed");
+  }
+  return shader;
+}
+
+const program = gl.createProgram();
+gl.attachShader(program, compileShader(VERTEX_SRC, gl.VERTEX_SHADER));
+gl.attachShader(program, compileShader(FRAGMENT_SRC, gl.FRAGMENT_SHADER));
+gl.linkProgram(program);
+if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(program));
+  throw new Error("Program link failed");
+}
+gl.useProgram(program);
+
+// Fullscreen quad
+const posBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1, 1, -1, -1, 1,
+  -1, 1, 1, -1, 1, 1,
+]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(program, "a_pos");
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uniforms = {};
+["u_resolution", "u_center", "u_scale", "u_maxIter", "u_type", "u_juliaC", "u_palette", "u_time"]
+  .forEach((name) => (uniforms[name] = gl.getUniformLocation(program, name)));
+
+// ---- App state ----
+const state = {
+  type: 0,
+  centerRe: -0.5,
+  centerIm: 0,
+  scale: 3.0, // vertical extent of the view in complex-plane units
+  maxIter: 300,
+  juliaRe: -0.7,
+  juliaIm: 0.27,
+  palette: 0,
+  cycleSpeed: 0,
+  autopilot: false,
+};
+
+const typeDefaults = {
+  0: { centerRe: -0.5, centerIm: 0, scale: 3.0 },
+  1: { centerRe: 0, centerIm: 0, scale: 3.0 },
+  2: { centerRe: -0.4, centerIm: -0.5, scale: 3.0 },
+  3: { centerRe: 0, centerIm: 0, scale: 3.0 },
+};
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(window.innerWidth * dpr);
+  const h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener("resize", resize);
+resize();
+
+let startTime = performance.now();
+
+function draw() {
+  gl.uniform2f(uniforms.u_resolution, canvas.width, canvas.height);
+  gl.uniform2f(uniforms.u_center, state.centerRe, state.centerIm);
+  gl.uniform1f(uniforms.u_scale, state.scale);
+  gl.uniform1i(uniforms.u_maxIter, state.maxIter);
+  gl.uniform1i(uniforms.u_type, state.type);
+  gl.uniform2f(uniforms.u_juliaC, state.juliaRe, state.juliaIm);
+  gl.uniform1i(uniforms.u_palette, state.palette);
+  const t = ((performance.now() - startTime) / 1000) * (state.cycleSpeed / 100) * 0.3;
+  gl.uniform1f(uniforms.u_time, t);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+// ---- Autopilot: smooth cinematic zoom toward an interesting point ----
+const autopilotTargets = [
+  { re: -0.743643887037151, im: 0.13182590420533 },
+  { re: -0.16070135, im: 1.0375665 },
+  { re: -1.401155, im: 0 },
+  { re: 0.28693186889504513, im: 0.014286693904085048 },
+];
+let autopilotIdx = 0;
+let autopilotStart = 0;
+const AUTOPILOT_DURATION = 9000; // ms per leg (zoom in then reset)
+
+function autopilotStep(now) {
+  if (!state.autopilot) return;
+  const elapsed = now - autopilotStart;
+  const cyclePos = (elapsed % AUTOPILOT_DURATION) / AUTOPILOT_DURATION;
+  if (elapsed > AUTOPILOT_DURATION && cyclePos < 0.02) {
+    autopilotIdx = (autopilotIdx + 1) % autopilotTargets.length;
+  }
+  const target = autopilotTargets[autopilotIdx];
+  const startScale = 3.0;
+  const endScale = 0.00005;
+  // ease-in-out zoom
+  const easeT = cyclePos < 0.85 ? cyclePos / 0.85 : 1.0;
+  const eased = easeT * easeT * (3 - 2 * easeT); // smoothstep
+  const scale = startScale * Math.pow(endScale / startScale, eased);
+  state.scale = scale;
+  state.centerRe = target.re;
+  state.centerIm = target.im;
+  updateHud();
+}
+
+function loop() {
+  const now = performance.now();
+  autopilotStep(now);
+  draw();
+  requestAnimationFrame(loop);
 }
 
 // ---- UI wiring ----
 const fractalTypeEl = document.getElementById("fractalType");
-const juliaControlsEl = document.getElementById("juliaControls");
+const juliaGroupEl = document.getElementById("juliaGroup");
 const juliaReEl = document.getElementById("juliaRe");
 const juliaImEl = document.getElementById("juliaIm");
 const maxIterEl = document.getElementById("maxIter");
 const iterValEl = document.getElementById("iterVal");
 const paletteEl = document.getElementById("palette");
-const zoomSliderEl = document.getElementById("zoomSlider");
-const zoomValEl = document.getElementById("zoomVal");
-const centerReEl = document.getElementById("centerRe");
-const centerImEl = document.getElementById("centerIm");
+const cycleSpeedEl = document.getElementById("cycleSpeed");
+const cycleValEl = document.getElementById("cycleVal");
+const autopilotBtn = document.getElementById("autopilotBtn");
+const hudEl = document.getElementById("hud");
 
-function syncStateFromUI() {
-  state.type = fractalTypeEl.value;
-  state.maxIter = parseInt(maxIterEl.value, 10);
-  state.palette = paletteEl.value;
-  state.juliaRe = parseFloat(juliaReEl.value);
-  state.juliaIm = parseFloat(juliaImEl.value);
-  state.centerRe = parseFloat(centerReEl.value);
-  state.centerIm = parseFloat(centerImEl.value);
-
-  const zoomT = parseFloat(zoomSliderEl.value); // 0..1
-  const zoomFactor = Math.pow(2000, zoomT); // up to ~2000x
-  state.scale = 2.5 / zoomFactor;
-  zoomValEl.textContent = zoomFactor.toFixed(zoomFactor > 10 ? 0 : 1) + "x";
-
-  juliaControlsEl.style.display = state.type === "julia" ? "block" : "none";
+function updateHud() {
+  const zoom = 3.0 / state.scale;
+  hudEl.textContent = `zoom: ${zoom.toFixed(zoom > 100 ? 0 : 2)}x · center: (${state.centerRe.toFixed(6)}, ${state.centerIm.toFixed(6)})`;
 }
 
-function renderNow() {
-  syncStateFromUI();
-  render();
-}
+fractalTypeEl.addEventListener("change", () => {
+  state.type = parseInt(fractalTypeEl.value, 10);
+  juliaGroupEl.style.display = state.type === 1 ? "block" : "none";
+  const d = typeDefaults[state.type];
+  state.centerRe = d.centerRe;
+  state.centerIm = d.centerIm;
+  state.scale = d.scale;
+  updateHud();
+});
 
-document.getElementById("renderBtn").addEventListener("click", renderNow);
-fractalTypeEl.addEventListener("change", renderNow);
-paletteEl.addEventListener("change", renderNow);
 maxIterEl.addEventListener("input", () => {
-  iterValEl.textContent = maxIterEl.value;
+  state.maxIter = parseInt(maxIterEl.value, 10);
+  iterValEl.textContent = state.maxIter;
 });
-maxIterEl.addEventListener("change", renderNow);
-zoomSliderEl.addEventListener("input", () => {
-  syncStateFromUI();
+
+paletteEl.addEventListener("change", () => {
+  state.palette = parseInt(paletteEl.value, 10);
 });
-zoomSliderEl.addEventListener("change", renderNow);
-[juliaReEl, juliaImEl, centerReEl, centerImEl].forEach((el) =>
-  el.addEventListener("change", renderNow)
+
+cycleSpeedEl.addEventListener("input", () => {
+  state.cycleSpeed = parseInt(cycleSpeedEl.value, 10);
+  cycleValEl.textContent = state.cycleSpeed;
+});
+
+[juliaReEl, juliaImEl].forEach((el) =>
+  el.addEventListener("change", () => {
+    state.juliaRe = parseFloat(juliaReEl.value);
+    state.juliaIm = parseFloat(juliaImEl.value);
+  })
 );
 
+autopilotBtn.addEventListener("click", () => {
+  state.autopilot = !state.autopilot;
+  autopilotBtn.classList.toggle("active", state.autopilot);
+  autopilotBtn.innerHTML = state.autopilot ? "&#9724; Stop Autopilot" : "&#9654; Autopilot";
+  if (state.autopilot) {
+    autopilotStart = performance.now();
+    autopilotIdx = 0;
+  }
+});
+
 document.getElementById("resetBtn").addEventListener("click", () => {
-  centerReEl.value = state.type === "julia" ? 0 : -0.5;
-  centerImEl.value = 0;
-  zoomSliderEl.value = 0;
-  renderNow();
+  state.autopilot = false;
+  autopilotBtn.classList.remove("active");
+  autopilotBtn.innerHTML = "&#9654; Autopilot";
+  const d = typeDefaults[state.type];
+  state.centerRe = d.centerRe;
+  state.centerIm = d.centerIm;
+  state.scale = d.scale;
+  updateHud();
 });
 
 document.getElementById("downloadBtn").addEventListener("click", () => {
+  draw(); // ensure latest frame is in the buffer
   const link = document.createElement("a");
-  link.download = `${state.type}-fractal.png`;
+  link.download = "fractal.png";
   link.href = canvas.toDataURL("image/png");
   link.click();
 });
 
-// Click to zoom in/out, centered on the clicked point
-canvas.addEventListener("click", (e) => {
+// ---- Mouse interaction: wheel to zoom, drag to pan ----
+let isDragging = false;
+let lastX = 0, lastY = 0;
+
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  state.autopilot = false;
+  autopilotBtn.classList.remove("active");
+  autopilotBtn.innerHTML = "&#9654; Autopilot";
+
   const rect = canvas.getBoundingClientRect();
-  const px = ((e.clientX - rect.left) / rect.width) * canvas.width;
-  const py = ((e.clientY - rect.top) / rect.height) * canvas.height;
+  const mx = (e.clientX - rect.left) / rect.width;
+  const my = (e.clientY - rect.top) / rect.height;
+  const aspect = canvas.width / canvas.height;
+  const worldX = state.centerRe + (mx - 0.5) * state.scale * aspect;
+  const worldY = state.centerIm - (my - 0.5) * state.scale;
 
-  const aspect = canvas.height / canvas.width;
-  const halfW = state.scale / 2;
-  const halfH = state.scale * aspect / 2;
-  const clickedRe = state.centerRe + (px / canvas.width - 0.5) * 2 * halfW;
-  const clickedIm = state.centerIm + (py / canvas.height - 0.5) * 2 * halfH;
+  const zoomFactor = Math.exp(e.deltaY * 0.0015);
+  state.scale = Math.max(1e-9, Math.min(6, state.scale * zoomFactor));
 
-  centerReEl.value = clickedRe.toFixed(6);
-  centerImEl.value = clickedIm.toFixed(6);
+  // keep the point under the cursor fixed
+  state.centerRe = worldX - (mx - 0.5) * state.scale * aspect;
+  state.centerIm = worldY + (my - 0.5) * state.scale;
+  updateHud();
+}, { passive: false });
 
-  const currentT = parseFloat(zoomSliderEl.value);
-  const step = e.shiftKey ? -0.08 : 0.08;
-  zoomSliderEl.value = Math.max(0, Math.min(1, currentT + step));
-
-  renderNow();
+canvas.addEventListener("mousedown", (e) => {
+  isDragging = true;
+  canvas.classList.add("dragging");
+  lastX = e.clientX;
+  lastY = e.clientY;
+  state.autopilot = false;
+  autopilotBtn.classList.remove("active");
+  autopilotBtn.innerHTML = "&#9654; Autopilot";
+});
+window.addEventListener("mouseup", () => {
+  isDragging = false;
+  canvas.classList.remove("dragging");
+});
+window.addEventListener("mousemove", (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  const aspect = canvas.width / canvas.height;
+  state.centerRe -= (dx / canvas.height) * state.scale * aspect;
+  state.centerIm += (dy / canvas.height) * state.scale;
+  updateHud();
 });
 
-canvas.addEventListener("mousemove", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const px = ((e.clientX - rect.left) / rect.width) * canvas.width;
-  const py = ((e.clientY - rect.top) / rect.height) * canvas.height;
-  const aspect = canvas.height / canvas.width;
-  const halfW = state.scale / 2;
-  const halfH = state.scale * aspect / 2;
-  const re = state.centerRe + (px / canvas.width - 0.5) * 2 * halfW;
-  const im = state.centerIm + (py / canvas.height - 0.5) * 2 * halfH;
-  coordsEl.textContent = `real: ${re.toFixed(4)}, imag: ${im.toFixed(4)}`;
-});
+// Touch support (basic pan + pinch)
+let lastTouchDist = null;
+canvas.addEventListener("touchstart", (e) => {
+  if (e.touches.length === 1) {
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  }
+}, { passive: true });
+canvas.addEventListener("touchmove", (e) => {
+  state.autopilot = false;
+  autopilotBtn.classList.remove("active");
+  if (e.touches.length === 1) {
+    const dx = e.touches[0].clientX - lastX;
+    const dy = e.touches[0].clientY - lastY;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+    const aspect = canvas.width / canvas.height;
+    state.centerRe -= (dx / canvas.height) * state.scale * aspect;
+    state.centerIm += (dy / canvas.height) * state.scale;
+    updateHud();
+  } else if (e.touches.length === 2) {
+    const dist = Math.hypot(
+      e.touches[0].clientX - e.touches[1].clientX,
+      e.touches[0].clientY - e.touches[1].clientY
+    );
+    if (lastTouchDist != null) {
+      const zoomFactor = lastTouchDist / dist;
+      state.scale = Math.max(1e-9, Math.min(6, state.scale * zoomFactor));
+      updateHud();
+    }
+    lastTouchDist = dist;
+  }
+}, { passive: true });
+canvas.addEventListener("touchend", () => { lastTouchDist = null; });
 
-// Initial render
-renderNow();
+updateHud();
+loop();

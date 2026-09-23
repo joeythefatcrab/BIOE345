@@ -3,149 +3,152 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Fractal Explorer</title>
+<title>Fractal Explorer — GPU Edition</title>
 <style>
   :root {
-    --bg: #0b0b12;
-    --panel: #15151f;
-    --border: #2a2a3a;
-    --text: #e8e8f0;
-    --muted: #9a9ab0;
-    --accent: #7c5cff;
+    --bg: #05050a;
+    --panel: rgba(18, 18, 28, 0.72);
+    --border: #2c2c42;
+    --text: #eaeaf5;
+    --muted: #9a9ab5;
+    --accent: #a855f7;
+    --accent2: #22d3ee;
   }
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; height: 100%;
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
     background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
-  .app {
-    display: flex; flex-direction: column; height: 100%;
-  }
+  .app { position: relative; width: 100%; height: 100%; }
+  canvas { position: absolute; inset: 0; display: block; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+
   header {
-    padding: 14px 20px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+    padding: 16px 22px; display: flex; align-items: baseline; gap: 12px;
+    background: linear-gradient(to bottom, rgba(0,0,0,0.55), transparent);
+    pointer-events: none;
   }
-  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  header p { margin: 0; font-size: 13px; color: var(--muted); }
-  .main {
-    display: flex; flex: 1; min-height: 0;
+  header h1 {
+    margin: 0; font-size: 19px; font-weight: 700;
+    background: linear-gradient(90deg, var(--accent2), var(--accent));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  .controls {
-    width: 300px; flex-shrink: 0; padding: 16px; overflow-y: auto;
-    border-right: 1px solid var(--border); background: var(--panel);
+  header p { margin: 0; font-size: 12.5px; color: var(--muted); }
+
+  .panel {
+    position: absolute; top: 70px; left: 18px; z-index: 5; width: 268px;
+    background: var(--panel); backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 14px; padding: 16px;
+    max-height: calc(100% - 100px); overflow-y: auto;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
   }
-  .control-group { margin-bottom: 18px; }
-  .control-group label {
-    display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px;
-    text-transform: uppercase; letter-spacing: 0.04em;
+  .group { margin-bottom: 16px; }
+  .group label {
+    display: block; font-size: 11px; color: var(--muted); margin-bottom: 6px;
+    text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
   }
   select, input[type="number"] {
-    width: 100%; padding: 8px 10px; background: #1d1d2a; color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; font-size: 14px;
+    width: 100%; padding: 7px 9px; background: #1a1a28; color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px; font-size: 13px;
   }
-  input[type="range"] { width: 100%; }
+  input[type="range"] {
+    width: 100%; accent-color: var(--accent);
+  }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
-  .val { font-size: 12px; color: var(--muted); margin-top: 4px; }
   button {
-    width: 100%; padding: 10px; margin-top: 6px; border: none; border-radius: 6px;
-    background: var(--accent); color: white; font-size: 14px; font-weight: 600;
-    cursor: pointer;
+    width: 100%; padding: 9px; margin-top: 5px; border: none; border-radius: 8px;
+    background: linear-gradient(90deg, var(--accent2), var(--accent));
+    color: #0a0a12; font-size: 13px; font-weight: 700; cursor: pointer;
+    transition: filter 0.15s;
   }
+  button:hover { filter: brightness(1.15); }
   button.secondary {
     background: transparent; border: 1px solid var(--border); color: var(--text);
   }
-  .canvas-wrap {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    background: #05050a; position: relative; overflow: hidden;
+  button.active {
+    box-shadow: 0 0 0 2px var(--accent2) inset;
   }
-  canvas { cursor: crosshair; max-width: 100%; max-height: 100%; }
-  .hint {
-    position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
-    font-size: 12px; color: var(--muted); background: rgba(0,0,0,0.5);
-    padding: 4px 10px; border-radius: 12px; pointer-events: none;
+  .toggle-row { display: flex; gap: 8px; }
+  .toggle-row button { margin-top: 5px; }
+
+  .hud {
+    position: absolute; bottom: 14px; left: 18px; z-index: 5;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
+    color: var(--muted); background: rgba(0,0,0,0.5); padding: 6px 10px;
+    border-radius: 8px; pointer-events: none; line-height: 1.5;
   }
-  .coords {
-    position: absolute; top: 10px; left: 10px; font-size: 11px; color: var(--muted);
-    background: rgba(0,0,0,0.5); padding: 4px 8px; border-radius: 6px; font-family: monospace;
+  .credit {
+    position: absolute; bottom: 14px; right: 18px; z-index: 5;
+    font-size: 11px; color: var(--muted); background: rgba(0,0,0,0.5);
+    padding: 6px 10px; border-radius: 8px; pointer-events: none;
   }
 </style>
 </head>
 <body>
 <div class="app">
+  <canvas id="glcanvas"></canvas>
+
   <header>
-    <h1>Fractal Explorer</h1>
-    <p>Mandelbrot &amp; Julia sets &mdash; click to zoom, drag to pan</p>
+    <h1>&#9670; Fractal Explorer</h1>
+    <p>GPU-rendered &middot; scroll to zoom &middot; drag to pan</p>
   </header>
-  <div class="main">
-    <div class="controls">
-      <div class="control-group">
-        <label>Fractal Type</label>
-        <select id="fractalType">
-          <option value="mandelbrot">Mandelbrot Set</option>
-          <option value="julia">Julia Set</option>
-        </select>
-      </div>
 
-      <div class="control-group" id="juliaControls" style="display:none">
-        <label>Julia Constant (c)</label>
-        <div class="row">
-          <div>
-            <input type="number" id="juliaRe" value="-0.7" step="0.01">
-            <div class="val">real</div>
-          </div>
-          <div>
-            <input type="number" id="juliaIm" value="0.27" step="0.01">
-            <div class="val">imaginary</div>
-          </div>
-        </div>
-      </div>
+  <div class="panel">
+    <div class="group">
+      <label>Fractal Type</label>
+      <select id="fractalType">
+        <option value="0">Mandelbrot Set</option>
+        <option value="1">Julia Set</option>
+        <option value="2">Burning Ship</option>
+        <option value="3">Tricorn</option>
+      </select>
+    </div>
 
-      <div class="control-group">
-        <label>Max Iterations: <span id="iterVal">200</span></label>
-        <input type="range" id="maxIter" min="20" max="800" value="200" step="10">
+    <div class="group" id="juliaGroup" style="display:none">
+      <label>Julia Constant</label>
+      <div class="row">
+        <input type="number" id="juliaRe" value="-0.7" step="0.01">
+        <input type="number" id="juliaIm" value="0.27" step="0.01">
       </div>
+    </div>
 
-      <div class="control-group">
-        <label>Color Palette</label>
-        <select id="palette">
-          <option value="twilight">Twilight</option>
-          <option value="fire">Fire</option>
-          <option value="ocean">Ocean</option>
-          <option value="rainbow">Rainbow</option>
-          <option value="mono">Monochrome</option>
-        </select>
-      </div>
+    <div class="group">
+      <label>Iterations: <span id="iterVal">300</span></label>
+      <input type="range" id="maxIter" min="50" max="1500" value="300" step="10">
+    </div>
 
-      <div class="control-group">
-        <label>Zoom: <span id="zoomVal">1.0x</span></label>
-        <input type="range" id="zoomSlider" min="0" max="1" value="0" step="0.001">
-      </div>
+    <div class="group">
+      <label>Palette</label>
+      <select id="palette">
+        <option value="0">Twilight</option>
+        <option value="1">Fire</option>
+        <option value="2">Ocean</option>
+        <option value="3">Rainbow</option>
+        <option value="4">Neon</option>
+        <option value="5">Monochrome</option>
+      </select>
+    </div>
 
-      <div class="control-group">
-        <label>Center (Real / Imaginary)</label>
-        <div class="row">
-          <div>
-            <input type="number" id="centerRe" value="-0.5" step="0.01">
-          </div>
-          <div>
-            <input type="number" id="centerIm" value="0" step="0.01">
-          </div>
-        </div>
-      </div>
+    <div class="group">
+      <label>Color Cycle Speed: <span id="cycleVal">0</span></label>
+      <input type="range" id="cycleSpeed" min="0" max="100" value="0" step="1">
+    </div>
 
-      <button id="renderBtn">Render Fractal</button>
+    <div class="group toggle-row">
+      <button id="autopilotBtn">&#9654; Autopilot</button>
+    </div>
+
+    <div class="group">
       <button class="secondary" id="resetBtn">Reset View</button>
       <button class="secondary" id="downloadBtn">Download PNG</button>
     </div>
-
-    <div class="canvas-wrap">
-      <canvas id="fractalCanvas" width="800" height="800"></canvas>
-      <div class="coords" id="coords">real: 0, imag: 0</div>
-      <div class="hint">Click to zoom in &middot; Shift+click to zoom out &middot; Drag to pan</div>
-    </div>
   </div>
+
+  <div class="hud" id="hud">zoom: 1.00x &middot; center: (-0.5, 0)</div>
+  <div class="credit">z&#8319;&#8314;&#185; = z&#8319;&#178; + c</div>
 </div>
 
 <script src="fractal.js"></script>
