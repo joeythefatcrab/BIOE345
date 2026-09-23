@@ -31,6 +31,8 @@ const FRAGMENT_SRC = `
   uniform vec2 u_juliaC;
   uniform int u_palette;
   uniform float u_time;     // for color cycling
+  uniform float u_rotation; // camera rotation, radians
+  uniform float u_vignette; // 0..1 extra darkening at edges (autopilot flourish)
 
   vec3 palette(float t, int p) {
     t = clamp(t, 0.0, 1.0);
@@ -71,8 +73,14 @@ const FRAGMENT_SRC = `
     }
   }
 
+  vec2 rotate(vec2 v, float a) {
+    float c = cos(a), s = sin(a);
+    return vec2(c * v.x - s * v.y, s * v.x + c * v.y);
+  }
+
   void main() {
     vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
+    uv = rotate(uv, u_rotation);
     vec2 c0 = u_center + uv * u_scale;
 
     vec2 z;
@@ -125,6 +133,12 @@ const FRAGMENT_SRC = `
     float t = iter / float(u_maxIter);
     t = fract(t * 2.4 + u_time);
     vec3 col = palette(t, u_palette);
+
+    if (u_vignette > 0.0) {
+      float vig = 1.0 - u_vignette * smoothstep(0.4, 1.3, length(uv));
+      col *= vig;
+    }
+
     gl_FragColor = vec4(col, 1.0);
   }
 `;
@@ -162,7 +176,8 @@ gl.enableVertexAttribArray(posLoc);
 gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
 
 const uniforms = {};
-["u_resolution", "u_center", "u_scale", "u_maxIter", "u_type", "u_juliaC", "u_palette", "u_time"]
+["u_resolution", "u_center", "u_scale", "u_maxIter", "u_type", "u_juliaC", "u_palette",
+ "u_time", "u_rotation", "u_vignette"]
   .forEach((name) => (uniforms[name] = gl.getUniformLocation(program, name)));
 
 // ---- App state ----
@@ -177,7 +192,12 @@ const state = {
   palette: 0,
   cycleSpeed: 0,
   autopilot: false,
+  rotation: 0,
+  vignette: 0,
 };
+
+let userMaxIter = 300;   // the slider's own value, preserved across autopilot
+let userCycleSpeed = 0;  // ditto for color-cycle speed
 
 const typeDefaults = {
   0: { centerRe: -0.5, centerIm: 0, scale: 3.0 },
@@ -211,38 +231,98 @@ function draw() {
   gl.uniform1i(uniforms.u_palette, state.palette);
   const t = ((performance.now() - startTime) / 1000) * (state.cycleSpeed / 100) * 0.3;
   gl.uniform1f(uniforms.u_time, t);
+  gl.uniform1f(uniforms.u_rotation, state.rotation);
+  gl.uniform1f(uniforms.u_vignette, state.vignette);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 }
 
-// ---- Autopilot: smooth cinematic zoom toward an interesting point ----
-const autopilotTargets = [
-  { re: -0.743643887037151, im: 0.13182590420533 },
-  { re: -0.16070135, im: 1.0375665 },
-  { re: -1.401155, im: 0 },
-  { re: 0.28693186889504513, im: 0.014286693904085048 },
-];
+// ---- Autopilot: cinematic breathing dive with rotation, per fractal type ----
+// Each leg: dive in (with a slow camera rotation and rising detail/color drift),
+// hold briefly at max depth, then retreat back out before jumping to the next spot.
+const autopilotTargetsByType = {
+  0: [ // Mandelbrot — classic deep-zoom landmarks
+    { re: -0.743643887037151, im: 0.13182590420533, name: "Seahorse Valley" },
+    { re: -0.16070135, im: 1.0375665, name: "Spiral Junction" },
+    { re: -1.401155, im: 0, name: "Feigenbaum Point" },
+    { re: 0.28693186889504513, im: 0.014286693904085048, name: "Elephant Valley" },
+    { re: -0.7746806106269039, im: -0.1374168856037867, name: "Double Spiral" },
+  ],
+  1: [ // Julia set — orbits within its own bounded region
+    { re: 0.1, im: -0.02 },
+    { re: -0.55, im: 0.05 },
+    { re: 0.35, im: 0.3 },
+    { re: -0.2, im: 0.55 },
+  ],
+  2: [ // Burning Ship — jagged detail lives along its edges
+    { re: -1.7580856, im: -0.0253 },
+    { re: -1.7396807, im: -0.0288 },
+    { re: -1.62917, im: -0.0203 },
+  ],
+  3: [ // Tricorn
+    { re: -0.5, im: 0.5 },
+    { re: 0.25, im: 0.45 },
+    { re: -1.1, im: 0.2 },
+  ],
+};
 let autopilotIdx = 0;
 let autopilotStart = 0;
-const AUTOPILOT_DURATION = 9000; // ms per leg (zoom in then reset)
+let autopilotBaseScale = 3.0;
+const DIVE_DURATION = 7000;   // ms diving inward
+const HOLD_DURATION = 1400;   // ms lingering at depth
+const RETREAT_DURATION = 2600; // ms zooming back out before the jump
+const LEG_DURATION = DIVE_DURATION + HOLD_DURATION + RETREAT_DURATION;
+const ROTATION_SPEED = 0.05; // radians/sec, continuous throughout
+
+function currentAutopilotTargets() {
+  return autopilotTargetsByType[state.type] || autopilotTargetsByType[0];
+}
 
 function autopilotStep(now) {
   if (!state.autopilot) return;
+  const targets = currentAutopilotTargets();
   const elapsed = now - autopilotStart;
-  const cyclePos = (elapsed % AUTOPILOT_DURATION) / AUTOPILOT_DURATION;
-  if (elapsed > AUTOPILOT_DURATION && cyclePos < 0.02) {
-    autopilotIdx = (autopilotIdx + 1) % autopilotTargets.length;
+  const legPos = elapsed % LEG_DURATION;
+  const legIdx = Math.floor(elapsed / LEG_DURATION) % targets.length;
+  if (legIdx !== autopilotIdx) autopilotIdx = legIdx;
+  const target = targets[autopilotIdx];
+
+  const startScale = autopilotBaseScale;
+  const endScale = startScale * 0.00002;
+
+  let depth; // 0 = zoomed out, 1 = zoomed in fully
+  if (legPos < DIVE_DURATION) {
+    const p = legPos / DIVE_DURATION;
+    depth = p * p * (3 - 2 * p); // smoothstep ease
+  } else if (legPos < DIVE_DURATION + HOLD_DURATION) {
+    depth = 1;
+  } else {
+    const p = (legPos - DIVE_DURATION - HOLD_DURATION) / RETREAT_DURATION;
+    depth = 1 - p * p * (3 - 2 * p);
   }
-  const target = autopilotTargets[autopilotIdx];
-  const startScale = 3.0;
-  const endScale = 0.00005;
-  // ease-in-out zoom
-  const easeT = cyclePos < 0.85 ? cyclePos / 0.85 : 1.0;
-  const eased = easeT * easeT * (3 - 2 * easeT); // smoothstep
-  const scale = startScale * Math.pow(endScale / startScale, eased);
-  state.scale = scale;
+
+  state.scale = startScale * Math.pow(endScale / startScale, depth);
   state.centerRe = target.re;
   state.centerIm = target.im;
-  updateHud();
+
+  // continuous slow rotation for a "flying through space" feel
+  state.rotation = (elapsed / 1000) * ROTATION_SPEED;
+
+  // the deeper we dive, the more detail we need to keep it crisp
+  state.maxIter = Math.min(1800, Math.round(userMaxIter + depth * 900));
+
+  // color drifts faster at depth, and a vignette breathes in during the dive
+  state.cycleSpeed = userCycleSpeed + depth * 55;
+  state.vignette = 0.35 * depth;
+
+  syncControlsFromState();
+  updateHud(target.name);
+}
+
+function syncControlsFromState() {
+  maxIterEl.value = state.maxIter;
+  iterValEl.textContent = state.maxIter;
+  cycleSpeedEl.value = Math.min(100, Math.round(state.cycleSpeed));
+  cycleValEl.textContent = cycleSpeedEl.value;
 }
 
 function loop() {
@@ -265,12 +345,17 @@ const cycleValEl = document.getElementById("cycleVal");
 const autopilotBtn = document.getElementById("autopilotBtn");
 const hudEl = document.getElementById("hud");
 
-function updateHud() {
+function updateHud(landmarkName) {
   const zoom = 3.0 / state.scale;
-  hudEl.textContent = `zoom: ${zoom.toFixed(zoom > 100 ? 0 : 2)}x · center: (${state.centerRe.toFixed(6)}, ${state.centerIm.toFixed(6)})`;
+  const zoomStr = `zoom: ${zoom.toFixed(zoom > 100 ? 0 : 2)}x`;
+  const centerStr = `center: (${state.centerRe.toFixed(6)}, ${state.centerIm.toFixed(6)})`;
+  hudEl.textContent = landmarkName
+    ? `${zoomStr} · ${landmarkName} · ${centerStr}`
+    : `${zoomStr} · ${centerStr}`;
 }
 
 fractalTypeEl.addEventListener("change", () => {
+  if (state.autopilot) stopAutopilot();
   state.type = parseInt(fractalTypeEl.value, 10);
   juliaGroupEl.style.display = state.type === 1 ? "block" : "none";
   const d = typeDefaults[state.type];
@@ -281,8 +366,11 @@ fractalTypeEl.addEventListener("change", () => {
 });
 
 maxIterEl.addEventListener("input", () => {
-  state.maxIter = parseInt(maxIterEl.value, 10);
-  iterValEl.textContent = state.maxIter;
+  userMaxIter = parseInt(maxIterEl.value, 10);
+  if (!state.autopilot) {
+    state.maxIter = userMaxIter;
+    iterValEl.textContent = state.maxIter;
+  }
 });
 
 paletteEl.addEventListener("change", () => {
@@ -290,8 +378,11 @@ paletteEl.addEventListener("change", () => {
 });
 
 cycleSpeedEl.addEventListener("input", () => {
-  state.cycleSpeed = parseInt(cycleSpeedEl.value, 10);
-  cycleValEl.textContent = state.cycleSpeed;
+  userCycleSpeed = parseInt(cycleSpeedEl.value, 10);
+  if (!state.autopilot) {
+    state.cycleSpeed = userCycleSpeed;
+    cycleValEl.textContent = state.cycleSpeed;
+  }
 });
 
 [juliaReEl, juliaImEl].forEach((el) =>
@@ -301,20 +392,32 @@ cycleSpeedEl.addEventListener("input", () => {
   })
 );
 
+function stopAutopilot() {
+  state.autopilot = false;
+  autopilotBtn.classList.remove("active");
+  autopilotBtn.innerHTML = "&#9654; Autopilot";
+  state.rotation = 0;
+  state.vignette = 0;
+  state.maxIter = userMaxIter;
+  state.cycleSpeed = userCycleSpeed;
+  syncControlsFromState();
+}
+
 autopilotBtn.addEventListener("click", () => {
-  state.autopilot = !state.autopilot;
-  autopilotBtn.classList.toggle("active", state.autopilot);
-  autopilotBtn.innerHTML = state.autopilot ? "&#9724; Stop Autopilot" : "&#9654; Autopilot";
   if (state.autopilot) {
+    stopAutopilot();
+  } else {
+    state.autopilot = true;
+    autopilotBtn.classList.add("active");
+    autopilotBtn.innerHTML = "&#9632; Stop Autopilot";
+    autopilotBaseScale = typeDefaults[state.type].scale;
     autopilotStart = performance.now();
-    autopilotIdx = 0;
+    autopilotIdx = -1; // force landmark name to refresh on first frame
   }
 });
 
 document.getElementById("resetBtn").addEventListener("click", () => {
-  state.autopilot = false;
-  autopilotBtn.classList.remove("active");
-  autopilotBtn.innerHTML = "&#9654; Autopilot";
+  stopAutopilot();
   const d = typeDefaults[state.type];
   state.centerRe = d.centerRe;
   state.centerIm = d.centerIm;
@@ -336,9 +439,7 @@ let lastX = 0, lastY = 0;
 
 canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
-  state.autopilot = false;
-  autopilotBtn.classList.remove("active");
-  autopilotBtn.innerHTML = "&#9654; Autopilot";
+  if (state.autopilot) stopAutopilot();
 
   const rect = canvas.getBoundingClientRect();
   const mx = (e.clientX - rect.left) / rect.width;
@@ -361,9 +462,7 @@ canvas.addEventListener("mousedown", (e) => {
   canvas.classList.add("dragging");
   lastX = e.clientX;
   lastY = e.clientY;
-  state.autopilot = false;
-  autopilotBtn.classList.remove("active");
-  autopilotBtn.innerHTML = "&#9654; Autopilot";
+  if (state.autopilot) stopAutopilot();
 });
 window.addEventListener("mouseup", () => {
   isDragging = false;
@@ -390,8 +489,7 @@ canvas.addEventListener("touchstart", (e) => {
   }
 }, { passive: true });
 canvas.addEventListener("touchmove", (e) => {
-  state.autopilot = false;
-  autopilotBtn.classList.remove("active");
+  if (state.autopilot) stopAutopilot();
   if (e.touches.length === 1) {
     const dx = e.touches[0].clientX - lastX;
     const dy = e.touches[0].clientY - lastY;

@@ -21,7 +21,14 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   .app { position: relative; width: 100%; height: 100%; }
-  canvas { position: absolute; inset: 0; display: block; cursor: grab; }
+  canvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%; /* CSS display size must be explicit — a canvas's
+      display size otherwise defaults to its width/height ATTRIBUTES (the internal
+      pixel-buffer resolution), which on a high-DPI screen is larger than the
+      viewport, silently cropping the render to its top-left quarter. */
+    display: block; cursor: grab;
+  }
   canvas.dragging { cursor: grabbing; }
 
   header {
